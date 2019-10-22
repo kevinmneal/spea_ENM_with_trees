@@ -1,0 +1,424 @@
+---
+title: "Tree-based Methods - GBM and niche modeling"
+author: "Kevin Neal"
+date: "February 11, 2016"
+output:
+  pdf_document:
+    fig_height: 6
+    fig_width: 8
+    highlight: zenburn
+  html_document:
+    fig_height: 6
+    fig_width: 8
+    highlight: zenburn
+    theme: cerulean
+---
+
+```{r init, echo=F, include=F}
+library(dismo)
+library(raster)
+library(randomForest)
+library(gbm)
+library(tree)
+
+setwd("C:/Users/Kevin/Google Drive/UCLA Courses or Lab meetings etc/EEB263 Statistical Learning")
+load("C:/Users/Kevin/Google Drive/UCLA Courses or Lab meetings etc/EEB263 Statistical Learning/KevinNeal_RegressionTrees_ENMs_with_Spea2.RData") # loads the workspace so knitr doesn't have to re-evaluate everything...
+
+par(mfrow=c(1,1))
+
+spea <- read.csv("speapresabs01_latlon_bioclim.csv")
+
+attach(spea)
+```
+
+## What is Environmental Niche Modeling?
+- statistically predict species distribution based on known occurrences and environmental data
+- useful for:
+    - predicting new localities
+    - understanding biological niche space
+    - predicting past and future distributions
+    
+    
+![Species Distribution Modeling](http://i.imgur.com/EHO6XOf.png?1) 
+ 
+
+
+![Spea hammondii](http://i.imgur.com/PsRfF6F.jpg?1) 
+
+- Spea hammondii - western spadefoot toad 
+
+
+__Response variable: binary presence (1) or absence (0) __ 
+
+__Predictor environmental variables: __ 
+
+- BIO1 = Annual Mean Temperature
+- BIO2 = Mean Diurnal Range (Mean of monthly (max temp - min temp))
+- BIO3 = Isothermality (BIO2/BIO7) (* 100)
+- BIO4 = Temperature Seasonality (standard deviation *100)
+- BIO5 = Max Temperature of Warmest Month
+- BIO6 = Min Temperature of Coldest Month
+- BIO7 = Temperature Annual Range (BIO5-BIO6)
+- BIO8 = Mean Temperature of Wettest Quarter
+- BIO9 = Mean Temperature of Driest Quarter
+- BIO10 = Mean Temperature of Warmest Quarter
+- BIO11 = Mean Temperature of Coldest Quarter
+- BIO12 = Annual Precipitation
+- BIO13 = Precipitation of Wettest Month
+- BIO14 = Precipitation of Driest Month
+- BIO15 = Precipitation Seasonality (Coefficient of Variation)
+- BIO16 = Precipitation of Wettest Quarter
+- BIO17 = Precipitation of Driest Quarter
+- BIO18 = Precipitation of Warmest Quarter
+- BIO19 = Precipitation of Coldest Quarter 
+
+****** 
+
+\pagebreak
+
+```{r, eval=F, include=F}
+library(gbm)
+
+# subsample so test data gets presence and absence data
+trainpres <- sample(1:nrow(spea[1:88,]), nrow(spea[1:88,])/2) # presence points are rows 1-88
+trainabs <- sample(89:nrow(spea), nrow(spea[89:264,])/2) # absence points are rows 89-264
+train <- c(trainpres, trainabs)
+#spea.test <- spea[-train,"present"] # can just do spea[-train,]$present
+```
+
+# Classification Trees and Environmental Niche Modeling of *Spea hammondii* 
+
+## Single Classification Tree with Pruning
+
+```{r, eval=F}
+library(tree)
+PresYN <- ifelse(present<=0.5, "No", "Yes") # converts Sales to binary Yes or No
+speaYN <- data.frame(spea, PresYN)
+
+tree.spea <- tree(PresYN~. -lat-lon-present, speaYN)
+
+```
+
+```{r}
+library(tree)
+summary(tree.spea)
+plot(tree.spea)
+text(tree.spea,pretty=0,cex=0.7)
+
+#tree.spea
+
+```
+
+```{r, eval=F}
+
+# split observations into training and test sets, 
+# build tree using training set, evaluate performance using test data
+set.seed(2)
+train.tree.spea <- sample(1:nrow(speaYN), 132)
+test.tree.spea <- speaYN[-train,]
+PresYN.test <- PresYN[-train.tree.spea]
+tree.spea <- tree(PresYN~.-present-lon-lat,speaYN,subset=train)
+tree.spea.pred <- predict(tree.spea, test.tree.spea, type="class")
+```
+
+```{r}
+
+table(tree.spea.pred, PresYN.test)
+(80+36)/132 # rate of correct predictions
+```
+
+```{r, eval=F}
+# cv.tree() performs cross-validation to determine optimal level of tree complexity
+set.seed(3)
+cv.tree.spea <- cv.tree(tree.spea, FUN=prune.misclass)
+names(cv.tree.spea)
+cv.tree.spea # k refers to the cost-complexity parameter
+# dev refers to cross-validation error rate in this instance
+# tree with 4 nodes has lowest CV-error rate, at 27
+
+```
+
+```{r}
+par(mfrow=c(1,2))
+plot(cv.tree.spea$size, cv.tree.spea$dev, 
+     type="b", main="CV error v. Terminal nodes")
+plot(cv.tree.spea$k, cv.tree.spea$dev, 
+     type="b", main="CV error v. Cost complexity")
+
+```
+
+```{r, eval=F}
+# prune tree to 4 terminal nodes
+
+prune.tree.spea <- prune.misclass(tree.spea, best=4)
+```
+
+```{r}
+par(mfrow=c(1,1))
+plot(prune.tree.spea)
+text(prune.tree.spea, pretty=0, cex=0.7) # returns bio11, bio13, and bio1
+summary(prune.tree.spea)
+
+tree.spea.pred <- predict(prune.tree.spea, 
+                          test.tree.spea, 
+                          type="class")
+
+table(tree.spea.pred, PresYN.test)
+(75+40)/132
+
+# 4-node dataset has as good or slightly lower prediction rate as the unpruned
+```
+
+
+****** 
+
+\pagebreak 
+
+## Boosted Regression Tree method of Elith et al 
+
+```{r, eval=F}
+library(dismo)
+# https://cran.r-project.org/web/packages/dismo/vignettes/brt.pdf
+
+spea_train <- spea[train,]
+spea_test <- spea[-train,]
+
+
+# identify optimal number of trees
+# tweak parameters
+
+# 5-fold CV seems to work better than 10 here...
+cvdev <- cbind(rep(NA, 10),rep(NA, 10), rep(NA, 10), rep(NA, 10), rep(NA, 10))
+colnames(cvdev) <- c("tc01", "tc02", "tc03", "tc05", "tc10")
+tc <- c(1,2,3,5,10)
+for (j in 1:5){
+  for (i in 1:10){
+    mm <- gbm.step(data=spea_train, 
+                   gbm.x=4:22, 
+                   gbm.y=1, 
+                   family="bernoulli",
+                   tree.complexity=tc[j], 
+                   learning.rate=0.001, 
+                   bag.fraction=0.5, 
+                   n.folds=5,
+                   silent=T) 
+    #cvdev 0.73, cvAUC 0.908
+    cvdev[i,j] <- mm$cv.statistics$deviance.mean
+  }
+}
+#plot as dotplot... use ggplot and tidyr cuz i screwed up the format to do it right
+
+cvdev.long <- gather(as.data.frame(cvdev), "tc", "cvdev", 1:5)
+
+cvdevplot <- ggplot(cvdev.long, aes(x=tc, y=cvdev, fill=tc)) +
+  geom_dotplot(binaxis="y", stackdir="center",
+               stackratio=1.5, dotsize=0.8)
+cvdevplot + theme_classic() # tree complexity of 5 looks best here
+
+bestmodel <- gbm.step(data=spea_train, 
+                      gbm.x=4:22, 
+                      gbm.y=1, 
+                      family="bernoulli",
+                      tree.complexity=5, 
+                      learning.rate=0.001, 
+                      bag.fraction=0.5, 
+                      n.folds=5,
+                      silent=T)
+
+spea.simp <- gbm.simplify(bestmodel, n.drops=10)
+
+bestmodel.simp <- gbm.step(data=spea_train, 
+                           gbm.x=spea.simp$pred.list[[8]], 
+                           gbm.y=1,
+                           family="bernoulli", 
+                           tree.complexity=5, 
+                           learning.rate=0.001, 
+                           bag.fraction=0.5,
+                           n.folds=5)
+#dropping 8 is best for reducing error
+
+bestmodel$cv.statistics$deviance.mean
+bestmodel.simp$cv.statistics$deviance.mean
+
+```
+
+
+```{r}
+library(ggplot2)
+cvdevplot + labs(x="Tree Complexity", y="Cross Validation Deviance") 
+# tree complexity of 5 looks best here
+
+bestmodel$cv.statistics$deviance.mean
+bestmodel.simp$cv.statistics$deviance.mean
+
+```
+
+
+```{r variable importance}
+par(mfrow=c(1,2))
+summary(bestmodel, main="full model")
+summary(bestmodel.simp, main="simplified model")
+par(mfrow=c(1,1))
+```
+
+Both models show highest importance for BIO18 (precipitation of warmest quarter)  
+ 
+Full model top 5:  
+- bio18 (precipitation of warmest quarter)  
+- bio11 (mean temp of coldest quarter)  
+- bio1 (annual mean temperature)  
+- bio13 (precipitation of wettest month)  
+- bio15 (precipitation seasonality [coefficient of variation])  
+  
+Simplified model top 5: bio18, bio13, bio11, bio1, bio15  
+ 
+Pruned tree: bio11, bio13, bio1  
+
+
+```{r plotting functions and fitted values from model, eval=F, include=F}
+model <- bestmodel
+gbm.plot(model, n.plots=19, write.title=F)
+#gbm.plot.fits(model)
+
+par(mfrow=c(1,1))
+find.int <- gbm.interactions(model)
+find.int$rank.list
+gbm.perspec(model, 11, 1)
+
+```
+
+
+```{r predictions, eval=F}
+
+par(mfrow=c(1,2))
+
+library(dismo)
+library(raster)
+
+bclimRaster <- brick("C:/Users/Kevin/Google Drive/UCLA Courses or Lab meetings etc/EEB 234/Final Project files/bioclim2.5/ShamnarrowBC_2.5.grd")
+
+bclimRaster.simp <- bclimRaster[[c(spea.simp$pred.list[[8]]-3)]] 
+# exclude layers eliminated in the simplified model by gbm.simplify()
+
+spea.predict <- predict(bclimRaster, 
+                        model, 
+                        n.trees=model$gbm.call$best.trees, 
+                        type="response")
+
+spea.predict.simp <- predict(bclimRaster.simp, 
+                             bestmodel.simp,
+                             n.trees=bestmodel.simp$gbm.call$best.trees,
+                             type="response")
+
+# type="response" gives probabilities on logit scale 
+# using the response variable, i.e. presence/absence
+```
+
+```{r}
+par(mfrow=c(1,2))
+plot(spea.predict, 
+     main="full model predictions")
+plot(spea.predict.simp, 
+     main="simplified model predictions")
+
+```
+
+```{r, eval=F, echo=F, include=F}
+### review this in the BRT vignette
+
+### evaluate without using rasterbrick:
+# preds <- predict.gbm(model, spea_test, n.trees=model$gbm.call$best.trees, type="response") # uses the GBM model generated on the training data to predict presence probabilities on the test data
+# calc.deviance(obs=spea_test$present, pred=preds, calc.mean=TRUE) # compares predictions on test data to the actual presence/absence of the test data
+# d <- cbind(spea_test$present, preds) # actual presence in column 1, predicted in col 2
+# pres <- d[d[,1]==1,2] # makes an object of the predicted values at true presence points
+# abs <- d[d[,1]==0,2] # makes an object of the predicted values at true absence points
+# eval.spea <- evaluate(p=pres, a=abs)
+# plot(eval.spea, "ROC")
+# plot(eval.spea, "TPR")
+# boxplot(eval.spea)
+# density(eval.spea)
+# eval.spea
+
+```
+
+****** 
+
+\pagebreak
+
+## Model evaluation
+
+```{r model evaluation, eval=F}
+
+ee <- evaluate(
+  p=spea_test[spea_test[,1]==1,2:3], 
+  a=spea_test[spea_test[,1]==0,2:3], 
+  model=model, 
+  n.trees=model$gbm.call$best.trees, 
+  type="response", 
+  x=bclimRaster) 
+# evaluates model using sample coordinates to get predictor values
+# from raster brick and then calculate the response 
+# (i.e. predicted presence probability)
+
+ee.simp <- evaluate(
+  p=spea_test[spea_test[,1]==1,2:3], 
+  a=spea_test[spea_test[,1]==0,2:3], 
+  model=model, 
+  n.trees=bestmodel.simp$gbm.call$best.trees, 
+  type="response", 
+  x=bclimRaster)
+
+# ee <- evaluate(p=spea[1:88,2:3], 
+# a=spea[89:264,2:3], 
+# model=model, 
+# n.trees=model$gbm.call$best.trees, 
+# type="response", 
+# x=bclimRaster) 
+# run this if you want to evaluate using all data points for some reason
+```
+
+```{r evaluation plots}
+par(mfrow=c(1,2))
+
+plot(ee, "ROC", main="full model")
+plot(ee.simp, "ROC", main="simplified model")
+plot(ee, "TPR", main="full model")
+plot(ee.simp, "TPR", main="simplified model")
+boxplot(ee, main="full model")
+boxplot(ee.simp, main="simplified model")
+density(ee)
+density(ee.simp)
+
+threshold(ee.simp) # use any of these to select threshold above which predict species is present
+plot(spea.predict>0.3422406, main="presence using prevalence threshold") 
+# here, plotting only those areas of the map with a predicted suitability/probability value above the prevalence threshold
+# dismo authors tend to use spec_sens as threshold in their vignette examples...
+
+# can add the test and training points by presence or absence: 
+points(subset(spea_test,present==1)[,2:3], pch="+", col="blue")
+points(subset(spea_train,present==1)[,2:3], pch="+", col="red")
+points(subset(spea_test,present==0)[,2:3], pch="-", col="blue")
+points(subset(spea_train,present==0)[,2:3], pch="-", col="red")
+```
+
+
+```{r better evaluation maybe, include=F, eval=F, echo=F}
+# consider using var.monotone?
+
+for(i in 1:length(spea.tc10.lr001$var.names)){
+  plot(spea.tc10.lr001, i.var=i,
+       ntrees=gbm.perf(spea.tc10.lr001, plot.it=FALSE),
+       type="response")
+}
+
+
+
+```
+
+
+
+```{r, echo=F, include=F}
+par(mfrow=c(1,1))
+detach(spea)
+```
+
